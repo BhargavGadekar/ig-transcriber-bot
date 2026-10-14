@@ -1,0 +1,13 @@
+.git
+.env
+data
+models
+third_party
+venv
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+tests
+*.md
+!README.md

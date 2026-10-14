@@ -1,0 +1,25 @@
+[Unit]
+Description=Instagram → whisper.cpp Telegram transcription bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=igtranscriber
+Group=igtranscriber
+WorkingDirectory=/opt/ig-transcriber
+EnvironmentFile=/etc/igtranscriber/igtranscriber.env
+ExecStart=/opt/ig-transcriber/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ig-transcriber/data
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

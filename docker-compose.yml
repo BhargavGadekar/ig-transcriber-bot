@@ -1,0 +1,21 @@
+services:
+  ig-transcriber-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ig-transcriber-bot
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          memory: 1850M
+          cpus: "4.0"
+        reservations:
+          memory: 512M

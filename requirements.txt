@@ -1,0 +1,9 @@
+# Pinned dependencies (verified against PyPI on 2026-10-14).
+# pyrofork: maintained Pyrogram fork (same `from pyrogram import ...` API);
+# the [speedup] extra pulls tgcrypto-pyrofork for fast MTProto crypto.
+pyrofork[speedup]==2.3.69
+yt-dlp==2026.8.19
+pydantic==2.14.1
+pydantic-settings==2.15.0
+aiosqlite==0.22.1
+httpx>=0.27.0
