@@ -35,7 +35,7 @@ def test_summarizer_gemini_detection_and_success():
         llm_api_key="AIzaSyDummyGeminiKey",
     )
     assert settings.effective_llm_provider == "gemini"
-    assert settings.effective_llm_model == "gemini-3.1-flash-lite"
+    assert settings.effective_llm_model == "gemini-3-flash-preview"
 
     summarizer = Summarizer(settings)
     assert summarizer.is_configured
@@ -198,3 +198,119 @@ def test_summarizer_dual_output_parsing():
         assert "> [!summary] Executive Summary" in res.summary_markdown
         # Backwards compatible string check
         assert "> [!summary] Executive Summary" in res
+
+
+def test_summarizer_fallback_key_on_exhaustion():
+    settings = Settings(
+        tg_api_id=1,
+        tg_api_hash="hash",
+        tg_bot_token="token",
+        llm_api_key="sk-primary-exhausted",
+        llm_fallback_api_key="sk-working-fallback",
+    )
+    summarizer = Summarizer(settings)
+    assert "sk-primary-exhausted" in settings.effective_llm_api_keys
+    assert "sk-working-fallback" in settings.effective_llm_api_keys
+
+    # First call (primary key) raises 429 Too Many Requests; second call (fallback key) succeeds
+    req = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    err_429 = httpx.HTTPStatusError("429 Quota Exhausted", request=req, response=httpx.Response(429, request=req))
+
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json = MagicMock(return_value={"choices": [{"message": {"content": "> [!summary] Executive Summary\n> Success with fallback."}}]})
+
+    calls = []
+    async def mock_post(*args, **kwargs):
+        headers = kwargs.get("headers", {})
+        calls.append(headers.get("Authorization"))
+        if len(calls) == 1:
+            raise err_429
+        return mock_resp
+
+    with patch("httpx.AsyncClient.post", side_effect=mock_post):
+        meta = VideoMeta(url="https://instagr.am/1", title="Failover Test")
+        res = asyncio.run(summarizer.summarize(meta, "Test speech transcript that needs fallback key"))
+
+        assert res is not None
+        assert "Success with fallback." in res
+        assert summarizer.stats()["success_count"] == 1
+        assert "Bearer sk-primary-exhausted" in calls[0]
+        assert "Bearer sk-working-fallback" in calls[1]
+
+
+def test_mac_hardware_optimization_concurrency():
+    s_mac = Settings(
+        tg_api_id=1,
+        tg_api_hash="hash",
+        tg_bot_token="token",
+        on_mac=True,
+    )
+    assert s_mac.effective_worker_concurrency == 3
+    assert s_mac.effective_download_concurrency == 4
+    assert s_mac.effective_threads >= 2
+
+    s_vps = Settings(
+        tg_api_id=1,
+        tg_api_hash="hash",
+        tg_bot_token="token",
+        on_mac=False,
+        is_mac=False,
+        worker_concurrency=1,
+        download_concurrency=2,
+    )
+    assert s_vps.effective_worker_concurrency == 1
+    assert s_vps.effective_download_concurrency == 2
+
+
+def test_summarizer_gemini_cascade_order():
+    settings = Settings(
+        tg_api_id=1,
+        tg_api_hash="hash",
+        tg_bot_token="token",
+        llm_api_key="AIzaSyPrimaryAccount",
+        llm_fallback_api_key="AIzaSyBackupAccount",
+        _env_file=None,
+    )
+    summarizer = Summarizer(settings)
+
+    calls = []
+    req = httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+    err_503 = httpx.HTTPStatusError("503 Overloaded", request=req, response=httpx.Response(503, request=req))
+
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json = MagicMock(return_value={
+        "choices": [{"message": {"content": "> [!summary] Executive Summary\n> Finally succeeded on stage 5."}}]
+    })
+
+    async def mock_post(*args, **kwargs):
+        json_data = kwargs.get("json", {})
+        headers = kwargs.get("headers", {})
+        model = json_data.get("model")
+        auth = headers.get("Authorization")
+        calls.append((model, auth))
+        # Fail the first 4 attempts, succeed on the 5th (gemini-2.5-flash on primary account)
+        if len(calls) < 5:
+            raise err_503
+        return mock_resp
+
+    with patch("httpx.AsyncClient.post", side_effect=mock_post):
+        meta = VideoMeta(url="https://instagr.am/1", title="Cascade Test")
+        res = asyncio.run(summarizer.summarize(meta, "A long speech transcript to trigger summarizer."))
+
+        assert res is not None
+        assert "Finally succeeded on stage 5." in res
+        # Check exact sequence of calls:
+        # 1. gemini-3-flash-preview on account 1
+        # 2. gemini-3-flash-preview on account 2
+        # 3. gemini-3.1-flash-lite on account 1
+        # 4. gemini-3.1-flash-lite on account 2
+        # 5. gemini-2.5-flash on account 1
+        assert len(calls) == 5
+        assert calls[0] == ("gemini-3-flash-preview", "Bearer AIzaSyPrimaryAccount")
+        assert calls[1] == ("gemini-3-flash-preview", "Bearer AIzaSyBackupAccount")
+        assert calls[2] == ("gemini-3.1-flash-lite", "Bearer AIzaSyPrimaryAccount")
+        assert calls[3] == ("gemini-3.1-flash-lite", "Bearer AIzaSyBackupAccount")
+        assert calls[4] == ("gemini-2.5-flash", "Bearer AIzaSyPrimaryAccount")
+

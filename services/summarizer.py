@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("summarizer")
 
-SYSTEM_PROMPT = """You are an expert audio transcription editor, linguist, and research assistant specializing in creating structured Obsidian notes from video transcripts.
+SYSTEM_PROMPT = """You are an expert audio transcription editor, linguist, and senior research assistant specializing in synthesizing video transcripts into world-class Obsidian notes.
 
 Your job has TWO parts:
 
@@ -24,14 +24,38 @@ PART 1: TRANSCRIPT RESTORATION & CLEANUP
 - CRITICAL: Keep all timestamp markers like [0:00], [1:44], [2:50] intact and in place!
 - Do not omit or summarize the transcript in Part 1; restore the full text line by line.
 
-PART 2: OBSIDIAN EXECUTIVE SUMMARY & ANALYSIS
-- Provide an Obsidian callout executive summary:
-> [!summary] Executive Summary
-> (2-4 concise, high-density sentences summarizing the core argument, message, or narrative)
+PART 2: OBSIDIAN EXECUTIVE SUMMARY & COMPREHENSIVE KNOWLEDGE SYNTHESIS
+Format the summary strictly for an Obsidian Knowledge Base / Lifebook vault. Use native Obsidian Markdown callouts and wikilinks:
 
-- Key Claims & Arguments (bullet points highlighting main propositions)
-- Key Facts & Evidence Mentioned (bullet points highlighting specific examples, data, names, or real-world events cited)
-- Takeaways / Conclusion (bullet points highlighting practical implications or conclusions)
+1. Executive Summary Callout (CRITICAL: MUST BE THE FIRST ELEMENT IN THE SUMMARY):
+> [!summary] Executive Summary
+> (2-4 concise, high-density sentences summarizing the core argument, thesis, or narrative of the video)
+
+2. Key Claims & Core Ideas:
+### 💡 Key Claims & Core Ideas
+- Bullet points distilling the speaker's main propositions, core arguments, and philosophical or technical flow.
+
+3. Key Books, References & Literature:
+### 📚 Key Books, References & Literature
+- **Explicit References**: If any books, authors, papers, studies, or thinkers were mentioned or cited in the video, list them with author name and specific context.
+- **Recommended Reading**: Recommend 1-2 foundational, authoritative books or seminal literature that expand directly on the concepts, psychology, business, or framework discussed in the video.
+- Format book titles and authors with Obsidian wikilinks: e.g. *[[Book Title]]* by [[Author Name]] — followed by a concise 1-2 sentence explanation of how its core thesis connects to this video.
+
+4. Key Facts, Data & Evidence:
+### 📊 Key Facts, Data & Evidence
+- Concrete bullet points highlighting specific numbers, percentages, data points, verified facts, scientific / biological principles, historical milestones, laws, or company case studies mentioned or underlying the claims.
+
+5. Mental Models & Conceptual Frameworks:
+### 🧠 Mental Models & Frameworks
+- Identify and link key mental models, cognitive biases, or conceptual frameworks at play (e.g. `[[First Principles Thinking]]`, `[[Pareto Principle]]`, `[[Compounding]]`, `[[Inversion]]`, `[[Opportunity Cost]]`, etc.).
+
+6. Actionable Takeaways & Next Steps:
+> [!tip] Actionable Takeaways
+> - Action-oriented bullet points outlining concrete habits, systems, or rules the viewer can apply immediately in their life or work.
+
+7. Related Topics & Tags:
+### 🏷️ Related Concepts & Tags
+- Wikilinks to related Obsidian subject notes (e.g. `[[Productivity]]`, `[[Psychology]]`, `[[Finance]]`, `[[Decision Making]]`) and relevant topic hashtags (e.g. `#reels #knowledge #summary`).
 
 OUTPUT FORMAT:
 You MUST format your output strictly with the following delimiters so automated parsers can extract them:
@@ -51,7 +75,7 @@ USER_PROMPT_TEMPLATE = """Video Metadata:
 Transcript:
 {transcript}
 
-Please restore the transcript and generate the Obsidian summary as instructed."""
+Please restore the transcript (preserving all timestamp markers) and generate the comprehensive Obsidian summary including key book references, facts, and actionable takeaways formatted for Obsidian notes as instructed."""
 
 
 class SummarizerResult(str):
@@ -136,7 +160,11 @@ class Summarizer:
             self.stats_data.last_status = "skipped"
             return None
 
-        api_key = self._settings.effective_llm_api_key
+        keys_to_try = getattr(self._settings, "effective_llm_api_keys", None) or [self._settings.effective_llm_api_key]
+        keys_to_try = [k for k in keys_to_try if k.strip()]
+        if not keys_to_try:
+            return None
+
         base_url = self._settings.effective_llm_base_url
         model = self._settings.effective_llm_model
         provider = self._settings.effective_llm_provider
@@ -152,47 +180,90 @@ class Summarizer:
             transcript=clean_transcript[:25000],  # generous safety token budget
         )
 
-        try:
-            raw_response: str | None = None
-            # 1. Primary path: OpenAI-compatible /chat/completions
-            try:
-                raw_response = await self._call_chat_completions(
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=model,
-                    prompt=prompt,
-                    timeout=timeout,
-                )
-            except Exception as first_exc:
-                # If provider is Gemini and OpenAI-compatible endpoint returned an error,
-                # fall back to native Google Gemini generateContent REST API
-                if provider == "gemini":
-                    log.info("OpenAI endpoint attempt on Gemini failed (%s); trying native Gemini API", first_exc)
-                    raw_response = await self._call_gemini_native(
-                        api_key=api_key,
-                        model=model,
-                        prompt=prompt,
-                        timeout=timeout,
+        # Determine model cascade sequence
+        if provider == "gemini":
+            models_to_try = [
+                "gemini-3-flash-preview",
+                "gemini-3.1-flash-lite",
+                "gemini-2.5-flash",
+            ]
+            # If user explicitly specified a custom model not in the standard cascade, try it first
+            if model and model not in models_to_try and model != "gemini-3-flash":
+                models_to_try.insert(0, model)
+        else:
+            models_to_try = [model]
+
+        last_error_exc: Exception | None = None
+        for current_model in models_to_try:
+            for acc_idx, current_api_key in enumerate(keys_to_try):
+                try:
+                    raw_response: str | None = None
+                    # 1. Primary path: OpenAI-compatible /chat/completions
+                    try:
+                        raw_response = await self._call_chat_completions(
+                            base_url=base_url,
+                            api_key=current_api_key,
+                            model=current_model,
+                            prompt=prompt,
+                            timeout=timeout,
+                        )
+                    except Exception as first_exc:
+                        # If provider is Gemini and OpenAI-compatible endpoint returned 404/405 or non-status error,
+                        # fall back to native Google Gemini generateContent REST API
+                        should_try_native = (
+                            provider == "gemini"
+                            and (
+                                not isinstance(first_exc, httpx.HTTPStatusError)
+                                or first_exc.response.status_code in (404, 405, 501)
+                            )
+                        )
+                        if should_try_native:
+                            log.info(
+                                "OpenAI endpoint attempt on Gemini failed for %s (%s); trying native Gemini API",
+                                current_model,
+                                first_exc,
+                            )
+                            raw_response = await self._call_gemini_native(
+                                api_key=current_api_key,
+                                model=current_model,
+                                prompt=prompt,
+                                timeout=timeout,
+                            )
+                        else:
+                            raise first_exc
+
+                    if raw_response and raw_response.strip():
+                        parsed = self._parse_response(raw_response)
+                        self.stats_data.last_status = "ok"
+                        self.stats_data.last_error = None
+                        self.stats_data.model = current_model
+                        self.stats_data.success_count += 1
+                        return parsed
+                    else:
+                        raise ValueError(f"LLM returned an empty response for {current_model}")
+
+                except Exception as exc:
+                    last_error_exc = exc
+                    masked_key = current_api_key[:10] + "..." if len(current_api_key) >= 10 else "***"
+                    log.warning(
+                        "LLM call failed with model %s on account %d (%s): %s; trying next fallback...",
+                        current_model,
+                        acc_idx + 1,
+                        masked_key,
+                        exc,
                     )
-                else:
-                    raise first_exc
+                    continue
 
-            if raw_response and raw_response.strip():
-                parsed = self._parse_response(raw_response)
-                self.stats_data.last_status = "ok"
-                self.stats_data.last_error = None
-                self.stats_data.success_count += 1
-                return parsed
-            else:
-                raise ValueError("LLM returned an empty response")
-
-        except Exception as exc:
-            err_msg = f"{type(exc).__name__}: {str(exc)[:250]}"
-            log.warning("LLM summarization failed: %s; skipping summary", err_msg)
-            self.stats_data.last_status = "error"
-            self.stats_data.last_error = err_msg
-            self.stats_data.error_count += 1
-            return None
+        err_msg = (
+            f"{type(last_error_exc).__name__}: {str(last_error_exc)[:250]}"
+            if last_error_exc
+            else "All model and account fallbacks failed"
+        )
+        log.warning("All LLM model & account fallbacks failed: %s; skipping summary", err_msg)
+        self.stats_data.last_status = "error"
+        self.stats_data.last_error = err_msg
+        self.stats_data.error_count += 1
+        return None
 
     def _parse_response(self, text: str) -> SummarizerResult:
         text = self._clean_markdown(text)

@@ -36,13 +36,13 @@ def test_database_lifecycle(tmp_path: Path):
 
         # User settings
         assert await db.get_user_settings(1) is None
-        await db.set_user_settings(1, timestamps=False, script_mode="native")
+        await db.set_user_settings(1, timestamps=False, script_mode="native", auto_transcribe=False)
         s1 = await db.get_user_settings(1)
-        assert s1 == {"timestamps": False, "script_mode": "native"}
+        assert s1 == {"timestamps": False, "script_mode": "native", "auto_transcribe": False}
         # Conflict update
-        await db.set_user_settings(1, timestamps=True, script_mode="roman")
+        await db.set_user_settings(1, timestamps=True, script_mode="roman", auto_transcribe=True)
         s2 = await db.get_user_settings(1)
-        assert s2 == {"timestamps": True, "script_mode": "roman"}
+        assert s2 == {"timestamps": True, "script_mode": "roman", "auto_transcribe": True}
 
         
         # Cleanup stale jobs

@@ -10,16 +10,17 @@ import aiosqlite
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER NOT NULL,
-    chat_id     INTEGER NOT NULL,
-    message_id  INTEGER,
-    url         TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'queued',
-    error       TEXT,
-    md_filename TEXT,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    chat_id        INTEGER NOT NULL,
+    message_id     INTEGER,
+    url            TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'queued',
+    error          TEXT,
+    md_filename    TEXT,
+    media_filename TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_user_created ON jobs(user_id, created_at);
 
@@ -31,10 +32,11 @@ CREATE TABLE IF NOT EXISTS transcripts (
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
-    user_id     INTEGER PRIMARY KEY,
-    timestamps  INTEGER NOT NULL DEFAULT 1,
-    script_mode TEXT NOT NULL DEFAULT 'roman',
-    updated_at  TEXT NOT NULL
+    user_id         INTEGER PRIMARY KEY,
+    timestamps      INTEGER NOT NULL DEFAULT 1,
+    script_mode     TEXT NOT NULL DEFAULT 'roman',
+    auto_transcribe INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL
 );
 """
 
@@ -61,6 +63,15 @@ class Database:
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
+        # Migrations for existing databases
+        for col_sql in (
+            "ALTER TABLE jobs ADD COLUMN media_filename TEXT",
+            "ALTER TABLE user_settings ADD COLUMN auto_transcribe INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                await self._conn.execute(col_sql)
+            except Exception:
+                pass
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -89,13 +100,24 @@ class Database:
         status: str,
         error: str | None = None,
         md_filename: str | None = None,
+        media_filename: str | None = None,
     ) -> None:
         await self.conn.execute(
-            "UPDATE jobs SET status = ?, error = ?, md_filename = COALESCE(?, md_filename), "
+            "UPDATE jobs SET status = ?, error = ?, "
+            "md_filename = COALESCE(?, md_filename), "
+            "media_filename = COALESCE(?, media_filename), "
             "updated_at = ? WHERE id = ?",
-            (status, error, md_filename, _now(), job_id),
+            (status, error, md_filename, media_filename, _now(), job_id),
         )
         await self.conn.commit()
+
+    async def get_job(self, job_id: int) -> dict[str, Any] | None:
+        async with self.conn.execute(
+            "SELECT * FROM jobs WHERE id = ?",
+            (job_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
 
     async def cleanup_stale_jobs(self) -> int:
         """Mark any unfinished jobs from an interrupted process as failed."""
@@ -150,22 +172,31 @@ class Database:
 
     async def get_user_settings(self, user_id: int) -> dict[str, Any] | None:
         async with self.conn.execute(
-            "SELECT timestamps, script_mode FROM user_settings WHERE user_id = ?",
+            "SELECT timestamps, script_mode, auto_transcribe FROM user_settings WHERE user_id = ?",
             (user_id,),
         ) as cur:
             row = await cur.fetchone()
         if row is None:
             return None
-        return {"timestamps": bool(row[0]), "script_mode": row[1]}
+        return {
+            "timestamps": bool(row[0]),
+            "script_mode": row[1],
+            "auto_transcribe": bool(row[2]) if len(row) > 2 and row[2] is not None else False,
+        }
 
     async def set_user_settings(
-        self, user_id: int, *, timestamps: bool, script_mode: str
+        self,
+        user_id: int,
+        *,
+        timestamps: bool,
+        script_mode: str,
+        auto_transcribe: bool = False,
     ) -> None:
         await self.conn.execute(
-            "INSERT INTO user_settings (user_id, timestamps, script_mode, updated_at) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO user_settings (user_id, timestamps, script_mode, auto_transcribe, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET timestamps = excluded.timestamps, "
-            "script_mode = excluded.script_mode, updated_at = excluded.updated_at",
-            (user_id, int(timestamps), script_mode, _now()),
+            "script_mode = excluded.script_mode, auto_transcribe = excluded.auto_transcribe, updated_at = excluded.updated_at",
+            (user_id, int(timestamps), script_mode, int(auto_transcribe), _now()),
         )
         await self.conn.commit()

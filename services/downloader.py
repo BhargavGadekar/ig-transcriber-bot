@@ -9,10 +9,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+import urllib.request
 
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -54,7 +55,7 @@ _FRIENDLY = {
     Kind.GEO_RESTRICTED: "🌍 This content is geo- or age-restricted in the bot's region.",
     Kind.TOO_LONG: "⏱ Video is too long ({duration} — limit is {limit}).",
     Kind.TOO_LARGE: "📦 Video file is too large{limit}.",
-    Kind.NO_VIDEO: "🚫 No downloadable video found at this link (it may be a photo-only or broken post).",
+    Kind.NO_VIDEO: "🚫 No downloadable video or photo found at this link.",
     Kind.LIVE: "🔴 Live streams are not supported.",
     Kind.EXTRACT_FAILED: "💥 yt-dlp could not process this link ({reason}). Try again later or update yt-dlp.",
 }
@@ -78,13 +79,15 @@ def _fail(kind: str, **fmt) -> DownloadFailure:
 
 @dataclass(slots=True)
 class DownloadResult:
-    filepath: Path
+    filepath: Path | None
     author: str
     title: str
     caption: str
     upload_date: date | None
     duration_s: int
     webpage_url: str
+    is_photo_only: bool = False
+    photo_paths: list[Path] = field(default_factory=list)
 
 
 def _classify(exc: BaseException) -> DownloadFailure:
@@ -92,7 +95,7 @@ def _classify(exc: BaseException) -> DownloadFailure:
     msg = str(exc).lower()
     if "max-filesize" in msg or "larger than max" in msg:
         return _fail(Kind.TOO_LARGE, limit="")
-    if "private" in msg:
+    if "private" in msg or "unavailable" in msg or "deleted" in msg:
         return _fail(Kind.PRIVATE)
     if any(
         token in msg
@@ -123,6 +126,79 @@ def _pick_video_entry(info: dict) -> dict | None:
     return (with_media or entries)[0]
 
 
+def _has_video_stream(info: dict) -> bool:
+    """Check if info or any of its entries contain video formats."""
+    if not info:
+        return False
+    if info.get("_type") == "playlist" or info.get("entries"):
+        for e in info.get("entries") or []:
+            if e and (e.get("formats") or e.get("duration")):
+                for f in e.get("formats") or []:
+                    if f.get("vcodec") and f.get("vcodec") != "none":
+                        return True
+                if e.get("duration"):
+                    return True
+        return False
+    for f in info.get("formats") or []:
+        if f.get("vcodec") and f.get("vcodec") != "none":
+            return True
+    return bool(info.get("duration"))
+
+
+def _extract_image_urls(info: dict) -> list[str]:
+    """Extract ordered high-resolution image URLs from a photo or carousel post."""
+    urls: list[str] = []
+    if info.get("_type") == "playlist" or info.get("entries"):
+        for e in info.get("entries") or []:
+            if not e:
+                continue
+            thumbs = e.get("thumbnails") or []
+            if thumbs:
+                best = max(
+                    thumbs,
+                    key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or len(t.get("url") or ""),
+                )
+                if best.get("url"):
+                    urls.append(best["url"])
+                    continue
+            if e.get("url") and not e.get("formats"):
+                urls.append(e["url"])
+    else:
+        thumbs = info.get("thumbnails") or []
+        if thumbs:
+            best = max(
+                thumbs,
+                key=lambda t: (t.get("width") or 0) * (t.get("height") or 0) or len(t.get("url") or ""),
+            )
+            if best.get("url"):
+                urls.append(best["url"])
+        elif info.get("url"):
+            urls.append(info["url"])
+    return urls
+
+
+def _download_photos_sync(urls: list[str], tmp_dir: Path) -> list[Path]:
+    """Download images in order in HD resolution."""
+    downloaded: list[Path] = []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    for idx, u in enumerate(urls):
+        dest = tmp_dir / f"photo_{idx:02d}.jpg"
+        try:
+            req = urllib.request.Request(u, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp, open(dest, "wb") as out:
+                out.write(resp.read())
+            if dest.is_file() and dest.stat().st_size > 0:
+                downloaded.append(dest)
+        except Exception:
+            log.warning("could not download image %s", u, exc_info=True)
+    return downloaded
+
+
 def _download_sync(
     url: str,
     tmp_dir: Path,
@@ -148,10 +224,36 @@ def _download_sync(
     # Pass 1: metadata only — enforce limits before transferring any bytes.
     with YoutubeDL(dict(common)) as ydl:
         try:
-            info = ydl.extract_info(url, download=False)
+            raw_info = ydl.extract_info(url, download=False)
         except DownloadError as exc:
             raise _classify(exc) from exc
-    info = _pick_video_entry(info or {})
+
+    if not _has_video_stream(raw_info):
+        image_urls = _extract_image_urls(raw_info or {})
+        if image_urls:
+            photos = _download_photos_sync(image_urls, tmp_dir)
+            if photos:
+                info = _pick_video_entry(raw_info or {}) or {}
+                raw_date = info.get("upload_date")
+                upload_date = None
+                if raw_date:
+                    try:
+                        upload_date = datetime.strptime(str(raw_date), "%Y%m%d").date()
+                    except ValueError:
+                        upload_date = None
+                return DownloadResult(
+                    filepath=None,
+                    author=str(info.get("uploader") or info.get("channel") or info.get("uploader_id") or ""),
+                    title=str(info.get("title") or ""),
+                    caption=str(info.get("description") or ""),
+                    upload_date=upload_date,
+                    duration_s=0,
+                    webpage_url=str(info.get("webpage_url") or url),
+                    is_photo_only=True,
+                    photo_paths=photos,
+                )
+
+    info = _pick_video_entry(raw_info or {})
     if not info:
         raise _fail(Kind.NO_VIDEO)
     if info.get("is_live"):

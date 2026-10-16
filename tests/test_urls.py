@@ -1,4 +1,12 @@
-from utils.urls import extract_instagram_urls, normalize_instagram_url
+from utils.urls import (
+    extract_instagram_urls,
+    extract_urls,
+    is_instagram_url,
+    is_youtube_url,
+    normalize_instagram_url,
+    normalize_url,
+    normalize_youtube_url,
+)
 
 
 class TestExtract:
@@ -58,6 +66,33 @@ class TestExtract:
         ]
 
 
+class TestYouTubeExtract:
+    def test_single_short_in_prose(self):
+        text = "check this https://www.youtube.com/shorts/dQw4w9WgXcQ?si=abc nice"
+        assert extract_urls(text) == [
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+        ]
+
+    def test_youtu_be_and_mobile_links(self):
+        text = "a https://youtu.be/dQw4w9WgXcQ?t=5 and b https://m.youtube.com/shorts/AbCdEfGh123"
+        assert extract_urls(text) == [
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/AbCdEfGh123",
+        ]
+
+    def test_mixed_instagram_and_youtube_preserves_order(self):
+        text = (
+            "first https://www.instagram.com/reel/CxAbCdEf123/ "
+            "then https://www.youtube.com/shorts/dQw4w9WgXcQ "
+            "and again https://instagram.com/p/BBBB2222/"
+        )
+        assert extract_urls(text) == [
+            "https://www.instagram.com/reel/CxAbCdEf123/",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.instagram.com/p/BBBB2222/",
+        ]
+
+
 class TestNormalize:
     def test_reels_plural_normalized_to_reel(self):
         assert normalize_instagram_url("https://www.instagram.com/reels/CODE123/") == (
@@ -89,3 +124,52 @@ class TestNormalize:
         assert normalize_instagram_url("https://www.instagram.com/share/reel/XYZ9/") == (
             "https://www.instagram.com/share/reel/XYZ9/"
         )
+
+
+class TestYouTubeNormalize:
+    def test_standard_shorts(self):
+        assert normalize_youtube_url("https://www.youtube.com/shorts/dQw4w9WgXcQ") == (
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+        )
+        assert normalize_youtube_url("https://youtube.com/shorts/dQw4w9WgXcQ/") == (
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+        )
+        assert normalize_youtube_url("https://m.youtube.com/shorts/dQw4w9WgXcQ?si=123") == (
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+        )
+
+    def test_youtu_be_format(self):
+        assert normalize_youtube_url("https://youtu.be/dQw4w9WgXcQ") == (
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+        )
+        assert normalize_youtube_url("youtu.be/dQw4w9WgXcQ?si=456") == (
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+        )
+
+    def test_watch_format(self):
+        assert normalize_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=10s") == (
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+        )
+
+    def test_invalid_youtube_urls(self):
+        assert normalize_youtube_url("https://evil.com/shorts/dQw4w9WgXcQ") is None
+        assert normalize_youtube_url("https://youtube.com/feed/subscriptions") is None
+        assert normalize_youtube_url("https://www.youtube.com/") is None
+        assert normalize_youtube_url("https://youtube.com/shorts/invalid") is None
+
+    def test_is_youtube_and_instagram(self):
+        assert is_youtube_url("https://youtube.com/shorts/dQw4w9WgXcQ") is True
+        assert is_youtube_url("https://youtu.be/dQw4w9WgXcQ") is True
+        assert is_youtube_url("https://instagram.com/reel/123/") is False
+        assert is_instagram_url("https://instagram.com/reel/123/") is True
+        assert is_instagram_url("https://youtube.com/shorts/123") is False
+
+    def test_normalize_url_handles_both(self):
+        assert normalize_url("https://www.instagram.com/reel/CxAbCdEf123/") == (
+            "https://www.instagram.com/reel/CxAbCdEf123/"
+        )
+        assert normalize_url("https://youtu.be/dQw4w9WgXcQ") == (
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ"
+        )
+        assert normalize_url("https://invalid.com") is None
+

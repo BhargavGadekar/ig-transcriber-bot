@@ -14,7 +14,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.progress import StatusReporter, send_with_flood_retry
 from core.pipeline import Job
-from utils.urls import extract_instagram_urls
+from utils.urls import extract_urls
 
 if TYPE_CHECKING:  # pragma: no cover
     from pyrogram.client import Client
@@ -24,30 +24,30 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 WELCOME = (
-    "👋 Send me an Instagram reel / video link and I'll transcribe it locally "
+    "👋 Send me an Instagram reel / video or YouTube Short link and I'll transcribe it locally "
     "with whisper.cpp and send you an Obsidian-ready .md note.\n\n"
-    "Example: https://www.instagram.com/reel/CxAbCdEf123/\n\n"
+    "Examples:\n"
+    "• https://www.instagram.com/reel/CxAbCdEf123/\n"
+    "• https://youtube.com/shorts/dQw4w9WgXcQ\n\n"
     "/help — details • /status — queue • /settings — preferences"
 )
 
 HELP_TEXT = (
     "📚 **How to use**\n\n"
-    "1. Send one or more Instagram links (reel, post, IGTV, share link) — "
-    "each gets its own transcription.\n"
-    "2. I download audio, transcribe it locally (whisper.cpp) and reply with a "
-    ".md file: link, metadata, timestamped transcript and the original caption.\n\n"
+    "1. Send one or more Instagram or YouTube Shorts links (reel, post, IGTV, share link, youtube.com/shorts, youtu.be).\n"
+    "2. Videos are downloaded in HD with natural 9:16 vertical preview.\n"
+    "3. Photos and carousels are sent in order as an HD photo album.\n"
+    "4. Videos include a [✅ Transcribe & Add to Notes] button to generate full Obsidian notes.\n\n"
     "**Commands**\n"
     "/status — queue length and your last job\n"
-    "/settings — toggle [mm:ss] timestamps and script mode (roman/native)\n"
+    "/settings — toggle timestamps, Hinglish script, and auto-transcribe mode\n"
+    "/clean_drive — manually wipe downloaded videos to free disk space\n"
     "/cancel — cancel your queued or running jobs\n\n"
-    "**Limits**\n"
-    "• Videos up to the configured duration/size limit (see /status of the bot owner's .env)\n"
+    "**Storage & Limits**\n"
+    "• Videos stay on device up to 50 videos max (older ones auto-deleted FIFO) or until midnight IST\n"
+    "• /clean_drive instantly frees all cached videos and temp files\n"
     "• Same link twice → instant cached result\n"
-    "• Private accounts need cookies (bot owner: see README → Cookies)\n\n"
-    "**Notes on Hinglish**\n"
-    "Whisper detects one language per window and often writes Hindi in Devanagari. "
-    "In /settings you can bias output toward Roman script with an initial prompt — "
-    "it helps, but it is not a true code-switching model; expect some drift."
+    "• Notes auto-save directly to your Obsidian vault\n"
 )
 
 
@@ -122,6 +122,7 @@ def register_handlers(client: "Client", app: "AppContext") -> None:
         stored = await app.db.get_user_settings(user_id) or {}
         timestamps = stored.get("timestamps", app.settings.timestamps)
         script_mode = stored.get("script_mode", app.settings.script_mode)
+        auto_tx = stored.get("auto_transcribe", app.settings.auto_transcribe)
         markup = InlineKeyboardMarkup(
             [
                 [
@@ -133,15 +134,21 @@ def register_handlers(client: "Client", app: "AppContext") -> None:
                         "🅰 Script: Roman" if script_mode == "roman" else "🅰 Script: Native",
                         callback_data="cfg:script",
                     ),
-                ]
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"⚡ Auto-Transcribe: {'ON' if auto_tx else 'OFF (On-Demand)'}",
+                        callback_data="cfg:autotx",
+                    ),
+                ],
             ]
         )
         text = (
             "⚙️ **Your settings**\n\n"
             f"• Timestamps: {'ON' if timestamps else 'OFF'} — [mm:ss] markers in the transcript\n"
-            f"• Script mode: {'Roman (romanized Hinglish)' if script_mode == 'roman' else 'Native (Devanagari for Hindi)'}\n\n"
-            "Tap a button to toggle. Script mode affects **new** transcriptions only — "
-            "cached links are not re-transcribed."
+            f"• Script mode: {'Roman (romanized Hinglish)' if script_mode == 'roman' else 'Native (Devanagari for Hindi)'}\n"
+            f"• Mode: {'Auto-transcribe every video' if auto_tx else 'On-demand (video first + [✅ Transcribe & Add to Notes] button)'}\n\n"
+            "Tap a button to toggle."
         )
         return text, markup
 
@@ -163,15 +170,18 @@ def register_handlers(client: "Client", app: "AppContext") -> None:
             stored = await app.db.get_user_settings(user_id) or {}
             timestamps = stored.get("timestamps", app.settings.timestamps)
             script_mode = stored.get("script_mode", app.settings.script_mode)
+            auto_tx = stored.get("auto_transcribe", app.settings.auto_transcribe)
             if data == "cfg:ts":
                 timestamps = not timestamps
             elif data == "cfg:script":
                 script_mode = "native" if script_mode == "roman" else "roman"
+            elif data == "cfg:autotx":
+                auto_tx = not auto_tx
             else:
                 await callback_query.answer()
                 return
             await app.db.set_user_settings(
-                user_id, timestamps=bool(timestamps), script_mode=script_mode
+                user_id, timestamps=bool(timestamps), script_mode=script_mode, auto_transcribe=bool(auto_tx)
             )
             text, markup = await _settings_text(user_id)
             await send_with_flood_retry(
@@ -189,6 +199,41 @@ def register_handlers(client: "Client", app: "AppContext") -> None:
             log.exception("settings callback failed")
             try:
                 await callback_query.answer("Failed — see logs")
+            except Exception:
+                pass
+
+    # --- /clean_drive ----------------------------------------------------------------
+    async def on_clean_drive(_client: "Client", message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        if app.settings.allowed_ids and user_id not in app.settings.allowed_ids:
+            return
+        from services.media_store import clean_drive
+        deleted, freed = clean_drive(app.settings.downloads_dir, app.settings.tmp_dir)
+        mb = freed / (1024 * 1024)
+        await _reply(
+            message,
+            f"🧹 **Drive Cleaned!**\n"
+            f"Removed **{deleted}** cached file(s).\n"
+            f"Freed: **{mb:.1f} MB** of storage space."
+        )
+
+    # --- force transcribe callback ---------------------------------------------------
+    async def on_force_transcribe_callback(_client: "Client", callback_query) -> None:
+        try:
+            user_id = callback_query.from_user.id
+            if app.settings.allowed_ids and user_id not in app.settings.allowed_ids:
+                await callback_query.answer("⛔ Unauthorized", show_alert=True)
+                return
+            job_id_str = callback_query.data.split(":", 1)[1]
+            job_id = int(job_id_str)
+            await callback_query.answer("Starting transcription & notes…")
+            asyncio.create_task(
+                app.jobs.force_transcribe_job(job_id, status_message=callback_query.message)
+            )
+        except Exception:
+            log.exception("error handling force transcribe callback")
+            try:
+                await callback_query.answer("Failed to start transcription.")
             except Exception:
                 pass
 
@@ -218,8 +263,10 @@ def register_handlers(client: "Client", app: "AppContext") -> None:
     client.add_handler(MessageHandler(on_help, command("help")))
     client.add_handler(MessageHandler(on_status, command("status")))
     client.add_handler(MessageHandler(on_settings, command("settings")))
+    client.add_handler(MessageHandler(on_clean_drive, command("clean_drive")))
     client.add_handler(MessageHandler(on_cancel, command("cancel")))
     client.add_handler(CallbackQueryHandler(on_settings_callback, filters.regex(r"^cfg:")))
+    client.add_handler(CallbackQueryHandler(on_force_transcribe_callback, filters.regex(r"^force_tx:")))
     client.add_handler(
         MessageHandler(
             on_message,
@@ -249,12 +296,12 @@ async def _handle_message(message: Message, app: "AppContext") -> None:
         return
 
     text = message.text or message.caption or ""
-    urls = extract_instagram_urls(text)
+    urls = extract_urls(text)
     if not urls:
         if message.chat.type == ChatType.PRIVATE and text.strip():
             await reply(
-                "Send me an Instagram link (reel / post / IGTV video) and I'll "
-                "transcribe it — e.g. https://www.instagram.com/reel/CxAbCdEf123/"
+                "Send me an Instagram reel / post or YouTube Short link and I'll "
+                "transcribe it — e.g. https://www.instagram.com/reel/CxAbCdEf123/ or https://youtube.com/shorts/dQw4w9WgXcQ"
             )
         return
 
@@ -278,7 +325,7 @@ async def _start_job(message: Message, app: "AppContext", url: str) -> None:
 
     db_id = await app.db.add_job(user_id, chat_id, message.id, url)
     cached = await app.db.get_transcript(url)
-    job = Job(db_id=db_id, user_id=user_id, chat_id=chat_id, url=url)
+    job = Job(db_id=db_id, user_id=user_id, chat_id=chat_id, message_id=message.id, url=url)
 
     if cached:
         await app.db.update_job(db_id, status="cached")

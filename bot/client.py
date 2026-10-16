@@ -29,7 +29,8 @@ async def set_bot_commands(client: Client) -> None:
         BotCommand("start", "Start the bot and see usage"),
         BotCommand("help", "How to use the bot"),
         BotCommand("status", "Queue length and your last job"),
-        BotCommand("settings", "Toggle timestamps and script mode"),
+        BotCommand("settings", "Toggle timestamps, script & auto-transcribe"),
+        BotCommand("clean_drive", "Clear downloaded videos to free disk space"),
         BotCommand("cancel", "Cancel your queued/running jobs"),
     ]
     try:

@@ -1,11 +1,16 @@
 # Secrets & local config
 .env
+.env.*
+!.env.example
 cookies.txt
+*.session
+*.session-journal
 
 # Runtime data
 data/
 models/
 output/
+downloads/
 
 # Built whisper.cpp checkout
 third_party/
@@ -21,3 +26,4 @@ venv/
 .ruff_cache/
 dist/
 build/
+

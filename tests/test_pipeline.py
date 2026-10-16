@@ -1,6 +1,6 @@
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from core.config import Settings
 from core.pipeline import Job, JobCancelled, JobManager
 
@@ -94,3 +94,42 @@ def test_job_manager_queue_capacity(tmp_path: Path):
         await manager.stop(timeout=0.5)
 
     asyncio.run(run())
+
+
+def test_render_and_deliver_saves_to_md_output_dir(tmp_path: Path):
+    async def run():
+        vault_dir = tmp_path / "Obsidian" / "Reels"
+        settings = Settings(
+            tg_api_id=1,
+            tg_api_hash="h",
+            tg_bot_token="t",
+            data_dir=tmp_path / "data",
+            md_output_dir=str(vault_dir),
+        )
+        db = MagicMock()
+        client = MagicMock()
+        client.send_message = AsyncMock()
+        client.send_document = AsyncMock()
+        manager = JobManager(settings, db, client)
+
+        from services.markdown import VideoMeta
+        from utils.text import Segment
+        meta = VideoMeta(url="https://instagr.am/reel/999", title="Test Reel", duration_s=30, author="creator")
+        segments = [Segment(start=0.0, end=5.0, text="Hello world")]
+
+        job = Job(db_id=1, user_id=10, chat_id=20, url="https://instagr.am/reel/999")
+        job.tmp_dir = tmp_path / "job_tmp"
+        job.tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        await manager._render_and_deliver(job, meta, segments, {})
+
+        # Verify vault directory was created and file was written
+        assert vault_dir.is_dir()
+        files = list(vault_dir.glob("*.md"))
+        assert len(files) == 1
+        content = files[0].read_text(encoding="utf-8")
+        assert "Hello world" in content
+        assert "Test Reel" in content
+
+    asyncio.run(run())
+

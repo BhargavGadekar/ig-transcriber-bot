@@ -31,10 +31,17 @@ class Settings(BaseSettings):
     session_name: str = "igtranscriber"
     allowed_user_ids: str = ""  # comma-separated; empty = open to everyone
 
+    # --- Platform / Machine Optimization ------------------------------------
+    on_mac: bool = True  # enable high-concurrency Mac parallel processing
+    is_mac: bool = True  # alias for on_mac
+
     # --- Paths ----------------------------------------------------------------
     data_dir: Path = Path("data")
+    downloads_dir: Path = Path("data/downloads")
+    max_downloaded_videos: int = 50  # FIFO ring buffer: keep max 50 videos on device
     cookies_file: str = ""  # Netscape cookies.txt exported for instagram.com
-    md_output_dir: str = ""  # optional: also save .md copies here (e.g. Obsidian vault)
+    # Optional: save copies of generated .md files (e.g. your Obsidian vault)
+    md_output_dir: str = ""
 
     # --- whisper.cpp ----------------------------------------------------------
     whisper_bin: str = "whisper-cli"
@@ -56,11 +63,14 @@ class Settings(BaseSettings):
     timestamp_interval_seconds: int = 45
     transcript_keep_tags: bool = False  # keep [MUSIC]-style tags if true
     preview_max_chars: int = 3500
+    auto_transcribe: bool = False  # false = download & send video with button; true = auto-transcribe
 
     # --- AI Summarization (LLM) ------------------------------------------------
     llm_api_key: str = ""  # Google Gemini API key or any OpenAI-compatible key
     gemini_api_key: str = ""  # alias for Google Gemini key
     openai_api_key: str = ""  # alias for OpenAI key
+    llm_fallback_api_key: str = ""  # Fallback key on quota exhaustion
+    gemini_fallback_api_key: str = ""  # alias for Gemini fallback key
     llm_base_url: str = ""  # custom base URL (e.g. OpenAI, Groq, Ollama, OpenRouter)
     llm_model: str = ""  # model name override (e.g. gemini-2.5-flash, gpt-4o-mini)
     llm_timeout_seconds: int = 45
@@ -126,10 +136,31 @@ class Settings(BaseSettings):
         return p
 
     @property
+    def effective_worker_concurrency(self) -> int:
+        if self.worker_concurrency > 1:
+            return self.worker_concurrency
+        if self.on_mac or self.is_mac:
+            # 3 parallel transcription workers on Mac Apple Silicon (16GB RAM + Metal)
+            return 3
+        return 1
+
+    @property
+    def effective_download_concurrency(self) -> int:
+        if self.download_concurrency > 2:
+            return self.download_concurrency
+        if self.on_mac or self.is_mac:
+            return 4
+        return 2
+
+    @property
     def effective_threads(self) -> int:
         if self.whisper_threads > 0:
             return self.whisper_threads
         cpus = os.cpu_count() or 1
+        workers = self.effective_worker_concurrency
+        if (self.on_mac or self.is_mac) and workers > 1:
+            # Distribute CPU cores among parallel workers (e.g. 10 cores -> 4 threads each)
+            return max(2, min(6, (cpus + workers - 1) // workers + 1))
         # On VPS with <= 4 cores, use all available cores for fast transcription.
         # On machines with > 4 cores, leave 1 core for I/O and OS.
         return min(4, cpus) if cpus <= 4 else max(1, cpus - 1)
@@ -146,18 +177,34 @@ class Settings(BaseSettings):
         )
 
     @property
+    def effective_llm_api_keys(self) -> list[str]:
+        keys: list[str] = []
+        primary = self.effective_llm_api_key
+        if primary:
+            keys.append(primary)
+            fallback = (
+                self.llm_fallback_api_key.strip()
+                or self.gemini_fallback_api_key.strip()
+                or os.environ.get("LLM_FALLBACK_API_KEY", "").strip()
+                or os.environ.get("GEMINI_FALLBACK_API_KEY", "").strip()
+            )
+            if fallback and fallback not in keys:
+                keys.append(fallback)
+        return keys
+
+    @property
     def effective_llm_provider(self) -> str:
         key = self.effective_llm_api_key
         url = self.llm_base_url.strip().lower()
         model = self.llm_model.strip().lower()
         if not key:
             return "none"
-        if "googleapis.com" in url or key.startswith("AIza") or key.startswith("AQ.") or "gemini" in model:
-            return "gemini"
         if "openai.com" in url or key.startswith("sk-"):
             return "openai"
         if "groq.com" in url or key.startswith("gsk_"):
             return "groq"
+        if "googleapis.com" in url or key.startswith("AIza") or key.startswith("AQ.") or "gemini" in model:
+            return "gemini"
         if "openrouter" in url:
             return "openrouter"
         if "deepseek" in url:
@@ -179,12 +226,14 @@ class Settings(BaseSettings):
     def effective_llm_model(self) -> str:
         raw = self.llm_model.strip()
         if raw:
+            if raw.lower() in ("gemini-3-flash", "models/gemini-3-flash"):
+                return "gemini-3-flash-preview"
             if raw.lower() in ("gemini-2.5-flash", "models/gemini-2.5-flash"):
-                return "gemini-3.1-flash-lite"
+                return "gemini-2.5-flash"
             return raw
         provider = self.effective_llm_provider
         if provider == "gemini":
-            return "gemini-3.1-flash-lite"
+            return "gemini-3-flash-preview"
         if provider == "groq":
             return "llama-3.3-70b-versatile"
         return "gpt-4o-mini"
@@ -206,7 +255,7 @@ class Settings(BaseSettings):
         return self.data_dir / "bot.db"
 
     def ensure_dirs(self) -> None:
-        for path in (self.data_dir, self.tmp_dir, self.log_dir):
+        for path in (self.data_dir, self.tmp_dir, self.log_dir, self.downloads_dir):
             path.mkdir(parents=True, exist_ok=True)
         if self.md_output_dir:
             Path(self.md_output_dir).mkdir(parents=True, exist_ok=True)

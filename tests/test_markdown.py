@@ -72,6 +72,24 @@ class TestRenderMarkdown:
         assert "# Instagram video" in md
 
 
+    def test_youtube_frontmatter_and_platform(self):
+        meta = VideoMeta(
+            url="https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            author="RickAstley",
+            title="",
+            duration_s=45,
+        )
+        md = render_markdown(meta, "Short transcript")
+        assert 'source: "https://www.youtube.com/shorts/dQw4w9WgXcQ"' in md
+        assert "platform: youtube" in md
+        assert "tags: [transcript, youtube]" in md
+        assert "# YouTube Short" in md
+
+        # Fallback filename for youtube
+        empty_meta = VideoMeta(url="https://www.youtube.com/shorts/dQw4w9WgXcQ")
+        assert "_youtube_" in build_md_filename(empty_meta)
+
+
 class TestFilename:
     def test_filename_shape(self):
         name = build_md_filename(META)
@@ -111,3 +129,4 @@ class TestSerializationRoundtrip:
         data = META.to_dict()
         restored = VideoMeta.from_dict(data)
         assert restored == META
+

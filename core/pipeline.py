@@ -17,12 +17,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+
 from bot.progress import send_with_flood_retry
 from services.audio import AudioError, extract_audio_wav, probe_duration_seconds
 from services.downloader import DownloadFailure, download_video
 from services.markdown import VideoMeta, build_md_filename, render_markdown
+from services.media_store import clean_drive, midnight_ist_cleanup, save_media_to_archive
 from services.summarizer import Summarizer
 from services.transcriber import TranscribeFailure, transcribe
+from services.video import generate_video_thumbnail, probe_video
 from utils.files import make_job_dir, remove_tree
 from utils.languages import language_name
 from utils.text import (
@@ -33,7 +37,7 @@ from utils.text import (
     render_transcript,
     word_count,
 )
-from utils.urls import normalize_instagram_url
+from utils.urls import normalize_url, normalize_instagram_url
 
 if TYPE_CHECKING:  # pragma: no cover
     from pyrogram.client import Client
@@ -69,6 +73,7 @@ class Job:
     user_id: int
     chat_id: int
     url: str
+    message_id: int | None = None
     reporter: ProgressReporter | None = None
     state: str = "queued"
     tmp_dir: Path | None = None
@@ -101,10 +106,12 @@ class JobManager:
         self._settings = settings
         self._db = db
         self._client = client
-        self._download_sem = asyncio.Semaphore(max(1, settings.download_concurrency))
+        dl_concurrency = getattr(settings, "effective_download_concurrency", settings.download_concurrency)
+        self._download_sem = asyncio.Semaphore(max(1, dl_concurrency))
         self._queue: asyncio.Queue[Job | None] = asyncio.Queue(maxsize=max(10, settings.queue_max_size))
         self._workers: list[asyncio.Task] = []
         self._stage_tasks: set[asyncio.Task] = set()
+        self._cleanup_task: asyncio.Task | None = None
         self._jobs: dict[int, Job] = {}
         self._started_at = time.monotonic()
         self._summarizer = Summarizer(settings)
@@ -113,12 +120,28 @@ class JobManager:
     # --- lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
-        for i in range(max(1, self._settings.worker_concurrency)):
+        worker_count = getattr(self._settings, "effective_worker_concurrency", self._settings.worker_concurrency)
+        for i in range(max(1, worker_count)):
             self._workers.append(
                 asyncio.create_task(self._worker(i), name=f"whisper-worker-{i}")
             )
+        self._cleanup_task = asyncio.create_task(
+            self._periodic_midnight_cleanup(), name="midnight-cleanup"
+        )
+
+    async def _periodic_midnight_cleanup(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(3600)  # check every hour
+                midnight_ist_cleanup(self._settings.downloads_dir)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("error in periodic midnight cleanup")
 
     async def stop(self, timeout: float = 10.0) -> None:
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
         for _ in self._workers:
             self._queue.put_nowait(None)
         if self._workers:
@@ -207,6 +230,36 @@ class JobManager:
                     settings=self._settings,
                     progress=progress if job.reporter else None,
                 )
+
+            # 1. If post contains only images (carousel/photo), deliver photos and finish
+            if job.download_result and getattr(job.download_result, "is_photo_only", False):
+                await self._deliver_photos(job)
+                return
+
+            # 2. Archive video to persistent downloads directory (FIFO ring buffer max 50)
+            archived = None
+            if job.download_result and getattr(job.download_result, "filepath", None):
+                archived = save_media_to_archive(
+                    job.download_result.filepath,
+                    archive_dir=self._settings.downloads_dir,
+                    max_files=self._settings.max_downloaded_videos,
+                )
+            archived_filename = archived.name if archived else None
+            await self._db.update_job(
+                job.db_id, status="downloaded", media_filename=archived_filename
+            )
+
+            # 3. Check auto_transcribe preference
+            user_settings = await self._db.get_user_settings(job.user_id) or {}
+            auto_tx = user_settings.get("auto_transcribe")
+            if auto_tx is None:
+                auto_tx = self._settings.auto_transcribe
+
+            if not auto_tx:
+                # Mode: On-Demand. Send video right away with button!
+                await self._deliver_video_with_button(job, archived_filename)
+                return
+
             job.throw_if_cancelled()
             job.state = "waiting"
             q_wait = self._queue.qsize() + 1
@@ -317,8 +370,18 @@ class JobManager:
                 keep_tags=self._settings.transcript_keep_tags,
                 to_roman=to_roman,
             )
-            if not segments:
-                raise TranscribeFailure("no_speech", "🤫 No speech detected in this audio.")
+            is_music_or_empty = not segments or all(
+                s.text.strip().strip("[]()♪♫🎵🎶").strip() == "" for s in segments
+            )
+            if is_music_or_empty:
+                await self._deliver_music_video(
+                    job,
+                    meta_author=downloaded.author,
+                    meta_title=downloaded.title,
+                    meta_caption=downloaded.caption,
+                    duration_s=duration_s,
+                )
+                return
 
             language = (result.language or "").strip().lower() or "und"
             if to_roman and language in ("ur", "hi", "und"):
@@ -344,10 +407,12 @@ class JobManager:
                 raw_text = "\n\n".join(s.text for s in segments)
                 summary_text = await self._summarizer.summarize(meta, raw_text)
                 if summary_text:
-                    meta.summary = summary_text
+                    meta.summary = str(summary_text)
+                    if getattr(summary_text, "cleaned_transcript", None):
+                        meta.transcript_text = summary_text.cleaned_transcript
             # Cache under both the requested URL and the canonical page URL
             # (share links resolve to a different canonical form).
-            canonical = normalize_instagram_url(downloaded.webpage_url) or job.url
+            canonical = normalize_url(downloaded.webpage_url) or job.url
             segment_dicts = [
                 {"start": s.start, "end": s.end, "text": s.text} for s in segments
             ]
@@ -391,14 +456,17 @@ class JobManager:
         timestamps = user_settings.get("timestamps")
         if timestamps is None:
             timestamps = self._settings.timestamps
-        paragraphs = build_paragraphs(segments)
-        transcript_text = render_transcript(
-            paragraphs,
-            with_timestamps=bool(timestamps),
-            interval_s=max(10, self._settings.timestamp_interval_seconds),
-        )
+        if meta.transcript_text and meta.transcript_text.strip():
+            transcript_text = meta.transcript_text.strip()
+        else:
+            paragraphs = build_paragraphs(segments)
+            transcript_text = render_transcript(
+                paragraphs,
+                with_timestamps=bool(timestamps),
+                interval_s=max(10, self._settings.timestamp_interval_seconds),
+            )
         md_text = render_markdown(meta, transcript_text, summary_markdown=meta.summary)
-        words = word_count("\n\n".join(p.text for p in paragraphs))
+        words = word_count(transcript_text)
         return md_text, transcript_text, words
 
     async def _render_and_deliver(
@@ -415,13 +483,16 @@ class JobManager:
 
         def write_files() -> None:
             md_path.write_text(md_text, encoding="utf-8")
-            if self._settings.md_output_dir:
+            dest_dir_str = self._settings.md_output_dir
+            if dest_dir_str:
                 try:
-                    (Path(self._settings.md_output_dir) / filename).write_text(
-                        md_text, encoding="utf-8"
-                    )
+                    target_dir = Path(dest_dir_str)
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    target_file = target_dir / filename
+                    target_file.write_text(md_text, encoding="utf-8")
+                    log.info("Saved markdown note to Obsidian vault: %s", target_file)
                 except OSError:
-                    log.exception("could not save markdown copy to MD_OUTPUT_DIR")
+                    log.exception("could not save markdown copy to MD_OUTPUT_DIR (%s)", dest_dir_str)
 
         await asyncio.to_thread(write_files)
 
@@ -439,21 +510,34 @@ class JobManager:
             await job.reporter.finalize(f"{summary}\n📄 {filename}")
 
         if job.download_result and getattr(job.download_result, "filepath", None):
-            await self._send_media(job.chat_id, job.download_result.filepath, meta)
+            await self._send_media(
+                job.chat_id,
+                job.download_result.filepath,
+                meta,
+                reply_to_message_id=job.message_id,
+            )
 
         if meta.summary:
             callout = self._extract_summary_callout(meta.summary)
             if callout:
                 await self._send_text(
-                    job.chat_id, f"💡 *Executive Summary:*\n\n{callout}"[:4000]
+                    job.chat_id,
+                    f"💡 *Executive Summary:*\n\n{callout}"[:4000],
+                    reply_to_message_id=job.message_id,
                 )
 
         if len(transcript_text) <= self._settings.preview_max_chars:
             await self._send_text(
-                job.chat_id, f"📝 Preview:\n\n{transcript_text}"[:4000]
+                job.chat_id,
+                f"📝 Preview:\n\n{transcript_text}"[:4000],
+                reply_to_message_id=job.message_id,
             )
         await self._send_document(
-            job.chat_id, md_path, filename, caption=(meta.title[:180] or None)
+            job.chat_id,
+            md_path,
+            filename,
+            caption=(meta.title[:180] or None),
+            reply_to_message_id=job.message_id,
         )
 
     async def serve_cached(
@@ -469,7 +553,21 @@ class JobManager:
             filename = build_md_filename(meta)
             tmp_dir = make_job_dir(self._settings.tmp_dir)
             md_path = tmp_dir / filename
-            await asyncio.to_thread(md_path.write_text, md_text, "utf-8")
+
+            def write_cached_files() -> None:
+                md_path.write_text(md_text, encoding="utf-8")
+                dest_dir_str = self._settings.md_output_dir
+                if dest_dir_str:
+                    try:
+                        target_dir = Path(dest_dir_str)
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        dest_file = target_dir / filename
+                        dest_file.write_text(md_text, encoding="utf-8")
+                        log.info("Saved cached markdown note to Obsidian vault: %s", dest_file)
+                    except OSError:
+                        log.exception("could not save cached markdown copy to MD_OUTPUT_DIR (%s)", dest_dir_str)
+
+            await asyncio.to_thread(write_cached_files)
 
             lang_name = language_name(meta.language)
             lang_label = (
@@ -483,26 +581,43 @@ class JobManager:
             )
             if len(transcript_text) <= self._settings.preview_max_chars:
                 await self._send_text(
-                job.chat_id, f"📝 Preview:\n\n{transcript_text}"[:4000]
+                    job.chat_id,
+                    f"📝 Preview:\n\n{transcript_text}"[:4000],
+                    reply_to_message_id=job.message_id,
                 )
             await self._send_document(
-                job.chat_id, md_path, filename, caption=(meta.title[:180] or None)
+                job.chat_id,
+                md_path,
+                filename,
+                caption=(meta.title[:180] or None),
+                reply_to_message_id=job.message_id,
             )
-            await self._send_text(job.chat_id, summary)
+            await self._send_text(
+                job.chat_id,
+                summary,
+                reply_to_message_id=job.message_id,
+            )
             self.counters["cached"] += 1
         except Exception as exc:
             log.exception("job %s: failed to serve cached transcript", job.db_id)
             await self._send_text(
-                job.chat_id, "💥 Failed to send the cached transcript — see logs."
+                job.chat_id,
+                "💥 Failed to send the cached transcript — see logs.",
+                reply_to_message_id=job.message_id,
             )
             raise exc
         finally:
             remove_tree(tmp_dir)
 
-    async def _send_text(self, chat_id: int, text: str) -> None:
+    async def _send_text(
+        self, chat_id: int, text: str, reply_to_message_id: int | None = None
+    ) -> None:
         await send_with_flood_retry(
             lambda: self._client.send_message(
-                chat_id, text, disable_web_page_preview=True
+                chat_id,
+                text,
+                disable_web_page_preview=True,
+                reply_to_message_id=reply_to_message_id,
             )
         )
 
@@ -526,7 +641,12 @@ class JobManager:
         return "\n".join(lines).strip()
 
     async def _send_media(
-        self, chat_id: int, path: Path, meta: VideoMeta
+        self,
+        chat_id: int,
+        path: Path,
+        meta: VideoMeta,
+        reply_to_message_id: int | None = None,
+        reply_markup: InlineKeyboardMarkup | None = None,
     ) -> None:
         if not path or not path.exists():
             return
@@ -534,16 +654,33 @@ class JobManager:
         suffix = path.suffix.lower()
         try:
             if suffix in (".mp4", ".mov", ".mkv", ".webm", ".m4v"):
-                duration = int(meta.duration_s or 0) or None
+                info = await probe_video(path, ffprobe_bin=self._settings.ffprobe_bin)
+                thumb_path = path.parent / f"{path.stem}_thumb.jpg"
+                thumb_created = await generate_video_thumbnail(
+                    path, thumb_path, ffmpeg_bin=self._settings.ffmpeg_bin, at_second=1.0
+                )
+                duration = int(meta.duration_s or info.duration_s or 0) or None
+                thumb_file = str(thumb_path) if (thumb_created and thumb_path.exists()) else None
+
                 await send_with_flood_retry(
                     lambda: self._client.send_video(
                         chat_id,
                         video=str(path),
                         caption=caption,
                         duration=duration,
+                        width=info.width or None,
+                        height=info.height or None,
+                        thumb=thumb_file,
                         supports_streaming=True,
+                        reply_to_message_id=reply_to_message_id,
+                        reply_markup=reply_markup,
                     )
                 )
+                if thumb_path.exists():
+                    try:
+                        thumb_path.unlink()
+                    except OSError:
+                        pass
             elif suffix in (".mp3", ".m4a", ".wav", ".aac", ".ogg", ".opus"):
                 await send_with_flood_retry(
                     lambda: self._client.send_audio(
@@ -551,6 +688,8 @@ class JobManager:
                         audio=str(path),
                         caption=caption,
                         duration=int(meta.duration_s or 0) or None,
+                        reply_to_message_id=reply_to_message_id,
+                        reply_markup=reply_markup,
                     )
                 )
             else:
@@ -559,18 +698,29 @@ class JobManager:
                         chat_id,
                         document=str(path),
                         caption=caption,
+                        reply_to_message_id=reply_to_message_id,
+                        reply_markup=reply_markup,
                     )
                 )
         except Exception:
             log.warning("failed to deliver downloaded media %s", path, exc_info=True)
 
     async def _send_document(
-        self, chat_id: int, path: Path, filename: str, caption: str | None = None
+        self,
+        chat_id: int,
+        path: Path,
+        filename: str,
+        caption: str | None = None,
+        reply_to_message_id: int | None = None,
     ) -> None:
         try:
             await send_with_flood_retry(
                 lambda: self._client.send_document(
-                    chat_id, document=str(path), file_name=filename, caption=caption
+                    chat_id,
+                    document=str(path),
+                    file_name=filename,
+                    caption=caption,
+                    reply_to_message_id=reply_to_message_id,
                 )
             )
         except Exception as exc:
@@ -579,6 +729,312 @@ class JobManager:
                 "📤 Couldn't deliver the file to Telegram (it may be cached — "
                 "send the link again in a moment)."
             ) from exc
+
+    async def _deliver_photos(self, job: Job) -> None:
+        """Deliver Instagram photo/carousel posts as ordered HD media albums."""
+        photos = getattr(job.download_result, "photo_paths", [])
+        if not photos:
+            if job.reporter:
+                await job.reporter.finalize("🚫 No photos found.")
+            return
+
+        caption = job.download_result.caption or job.download_result.title or ""
+        caption = caption[:1000] if caption else None
+
+        try:
+            if len(photos) == 1:
+                await send_with_flood_retry(
+                    lambda: self._client.send_photo(
+                        job.chat_id,
+                        photo=str(photos[0]),
+                        caption=caption,
+                        reply_to_message_id=job.message_id,
+                    )
+                )
+            else:
+                media = []
+                for i, p in enumerate(photos):
+                    c = caption if i == 0 else None
+                    media.append(InputMediaPhoto(media=str(p), caption=c))
+                for chunk in [media[i:i + 10] for i in range(0, len(media), 10)]:
+                    await send_with_flood_retry(
+                        lambda: self._client.send_media_group(
+                            job.chat_id,
+                            media=chunk,
+                            reply_to_message_id=job.message_id,
+                        )
+                    )
+            if job.reporter:
+                await job.reporter.finalize(f"✅ Delivered {len(photos)} photo(s).")
+            job.state = "done"
+            self.counters["done"] += 1
+            await self._db.update_job(job.db_id, status="done")
+        except Exception:
+            log.exception("failed to deliver photos for job %s", job.db_id)
+            if job.reporter:
+                await job.reporter.fail("💥 Failed to deliver photos to Telegram.")
+        finally:
+            self._cleanup(job)
+            self._jobs.pop(job.db_id, None)
+
+    async def _deliver_video_with_button(
+        self, job: Job, media_filename: str | None
+    ) -> None:
+        """Deliver downloaded video with [✅ Transcribe & Add to Notes] inline button."""
+        button = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Transcribe & Add to Notes", callback_data=f"force_tx:{job.db_id}")]]
+        )
+        if job.download_result and getattr(job.download_result, "filepath", None):
+            meta = VideoMeta(
+                url=job.url,
+                author=job.download_result.author,
+                title=job.download_result.title,
+                upload_date=job.download_result.upload_date,
+                duration_s=job.download_result.duration_s or None,
+                caption=job.download_result.caption,
+                language="",
+                model_name=self._settings.whisper_model_name,
+            )
+            await self._send_media(
+                job.chat_id,
+                job.download_result.filepath,
+                meta,
+                reply_to_message_id=job.message_id,
+                reply_markup=button,
+            )
+        if job.reporter:
+            await job.reporter.finalize("✅ Video ready! Tap below to transcribe & add to notes.")
+        job.state = "downloaded"
+        self.counters["done"] += 1
+        await self._db.update_job(
+            job.db_id, status="downloaded", media_filename=media_filename
+        )
+        self._cleanup(job)
+        self._jobs.pop(job.db_id, None)
+
+    async def _deliver_music_video(
+        self,
+        job: Job,
+        meta_author: str,
+        meta_title: str,
+        meta_caption: str,
+        duration_s: int,
+    ) -> None:
+        """Deliver video when only music or no clear speech was detected."""
+        button = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Transcribe & Add to Notes", callback_data=f"force_tx:{job.db_id}")]]
+        )
+        meta = VideoMeta(
+            url=job.url,
+            author=meta_author,
+            title=meta_title,
+            caption=meta_caption,
+            duration_s=duration_s or None,
+            language="music",
+            model_name=self._settings.whisper_model_name,
+        )
+        if job.download_result and getattr(job.download_result, "filepath", None):
+            await self._send_media(
+                job.chat_id,
+                job.download_result.filepath,
+                meta,
+                reply_to_message_id=job.message_id,
+                reply_markup=button,
+            )
+        if job.reporter:
+            await job.reporter.finalize(
+                "🎵 Background music / no clear speech detected.\n"
+                "Tap below to transcribe & add to notes anyway."
+            )
+        job.state = "music_only"
+        self.counters["done"] += 1
+        await self._db.update_job(job.db_id, status="music_only")
+        self._cleanup(job)
+        self._jobs.pop(job.db_id, None)
+
+    async def force_transcribe_job(
+        self, job_id: int, status_message: Any = None
+    ) -> None:
+        """Triggered on-demand when user taps [✅ Transcribe & Add to Notes]."""
+        job_data = await self._db.get_job(job_id)
+        if not job_data:
+            if status_message:
+                try:
+                    await status_message.edit_text("❌ Job record not found.")
+                except Exception:
+                    pass
+            return
+
+        chat_id = job_data["chat_id"]
+        user_id = job_data["user_id"]
+        url = job_data["url"]
+        message_id = job_data.get("message_id")
+
+        cached = await self._db.get_transcript(url)
+        if cached:
+            job = Job(db_id=job_id, user_id=user_id, chat_id=chat_id, message_id=message_id, url=url)
+            await self.serve_cached(job, cached[0], cached[1])
+            if status_message:
+                try:
+                    await status_message.edit_text("✅ Note generated from cache and saved to Obsidian!")
+                except Exception:
+                    pass
+            return
+
+        if status_message:
+            try:
+                await status_message.edit_text("✍️ Transcribing & generating Obsidian notes…")
+            except Exception:
+                pass
+
+        tmp_dir = make_job_dir(self._settings.tmp_dir)
+        try:
+            archived_fn = job_data.get("media_filename")
+            video_file = (self._settings.downloads_dir / archived_fn) if archived_fn else None
+
+            author = ""
+            title = ""
+            caption = ""
+            upload_date = ""
+
+            if not video_file or not video_file.exists():
+                if status_message:
+                    try:
+                        await status_message.edit_text("⬇️ Re-downloading video for transcription…")
+                    except Exception:
+                        pass
+                res = await download_video(url, tmp_dir, settings=self._settings)
+                video_file = res.filepath
+                author = res.author
+                title = res.title
+                caption = res.caption
+                upload_date = res.upload_date
+                archived = save_media_to_archive(
+                    video_file, self._settings.downloads_dir, self._settings.max_downloaded_videos
+                )
+                if archived:
+                    await self._db.update_job(job_id, status="transcribing", media_filename=archived.name)
+
+            if not video_file or not video_file.exists():
+                raise RuntimeError("Could not obtain video file for transcription.")
+
+            wav_path = tmp_dir / "audio.wav"
+            await extract_audio_wav(video_file, wav_path, ffmpeg_bin=self._settings.ffmpeg_bin)
+            duration_s = await probe_duration_seconds(video_file, ffprobe_bin=self._settings.ffprobe_bin)
+
+            user_settings = await self._db.get_user_settings(user_id) or {}
+            script_mode = user_settings.get("script_mode") or self._settings.script_mode
+            effective_settings = (
+                self._settings.model_copy(update={"script_mode": script_mode})
+                if script_mode != self._settings.script_mode
+                else self._settings
+            )
+
+            result = await transcribe(
+                wav_path,
+                tmp_dir / "transcript",
+                settings=effective_settings,
+                audio_duration_s=int(duration_s or 0) or None,
+            )
+
+            to_roman = (script_mode == "roman")
+            segments = clean_segments(
+                result.segments,
+                keep_tags=self._settings.transcript_keep_tags,
+                to_roman=to_roman,
+            )
+
+            if not segments:
+                fallback_text = caption or title or "[Instrumental / Background music only]"
+                segments = [Segment(start=0.0, end=float(duration_s or 1.0), text=fallback_text)]
+
+            language = (result.language or "").strip().lower() or "und"
+            if to_roman and language in ("ur", "hi", "und"):
+                language = "hinglish"
+
+            meta = VideoMeta(
+                url=url,
+                author=author,
+                title=title,
+                upload_date=upload_date,
+                duration_s=int(duration_s or 0) or None,
+                caption=caption,
+                language=language,
+                model_name=self._settings.whisper_model_name,
+            )
+
+            if self._summarizer and self._summarizer.is_configured:
+                if status_message:
+                    try:
+                        await status_message.edit_text("🧠 Generating Obsidian summary & book references…")
+                    except Exception:
+                        pass
+                raw_text = "\n\n".join(s.text for s in segments)
+                summary_text = await self._summarizer.summarize(meta, raw_text)
+                if summary_text:
+                    meta.summary = str(summary_text)
+                    if getattr(summary_text, "cleaned_transcript", None):
+                        meta.transcript_text = summary_text.cleaned_transcript
+
+            canonical = normalize_url(url) or url
+            segment_dicts = [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
+            for key in {url, canonical}:
+                try:
+                    await self._db.put_transcript(key, meta.to_dict(), segment_dicts)
+                except Exception:
+                    pass
+
+            md_text, transcript_text, words = self._render(meta, segments, user_settings)
+            filename = build_md_filename(meta)
+            md_path = tmp_dir / filename
+
+            def write_files() -> None:
+                md_path.write_text(md_text, encoding="utf-8")
+                dest_dir_str = self._settings.md_output_dir
+                if dest_dir_str:
+                    try:
+                        target_dir = Path(dest_dir_str)
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        target_file = target_dir / filename
+                        target_file.write_text(md_text, encoding="utf-8")
+                        log.info("Saved on-demand note to Obsidian: %s", target_file)
+                    except OSError:
+                        log.exception("could not save on-demand note to Obsidian")
+
+            await asyncio.to_thread(write_files)
+
+            if meta.summary:
+                callout = self._extract_summary_callout(meta.summary)
+                if callout:
+                    await self._send_text(
+                        chat_id, f"💡 *Executive Summary:*\n\n{callout}"[:4000], reply_to_message_id=message_id
+                    )
+
+            if len(transcript_text) <= self._settings.preview_max_chars:
+                await self._send_text(
+                    chat_id, f"📝 Preview:\n\n{transcript_text}"[:4000], reply_to_message_id=message_id
+                )
+
+            await self._send_document(
+                chat_id, md_path, filename, caption=(meta.title[:180] or None), reply_to_message_id=message_id
+            )
+
+            if status_message:
+                try:
+                    await status_message.edit_text(f"✅ Transcribed & added to Obsidian!\n📄 {filename}")
+                except Exception:
+                    pass
+
+            await self._db.update_job(job_id, status="done", md_filename=filename)
+        except Exception:
+            log.exception("failed on-demand transcription for job %s", job_id)
+            if status_message:
+                try:
+                    await status_message.edit_text("💥 Failed to transcribe this video — see logs.")
+                except Exception:
+                    pass
+        finally:
+            remove_tree(tmp_dir)
 
     # --- failure / cancellation ---------------------------------------------------
 

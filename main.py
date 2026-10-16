@@ -69,7 +69,7 @@ async def amain() -> None:
         "script_mode=%s, vad=%s)",
         settings.whisper_model_name,
         settings.effective_threads,
-        settings.worker_concurrency,
+        settings.effective_worker_concurrency,
         settings.script_mode,
         settings.whisper_vad,
     )

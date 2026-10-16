@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 
 from utils.files import sanitize_filename_part, short_id
 from utils.text import format_timestamp
+from utils.urls import is_youtube_url
 
 
 @dataclass(slots=True)
@@ -72,20 +73,25 @@ def render_markdown(
     transcribed_at: datetime | None = None,
 ) -> str:
     """Render the Obsidian-ready note: YAML frontmatter + body per template."""
-    title = (meta.title or "").strip() or "Instagram video"
+    is_yt = is_youtube_url(meta.url)
+    default_title = "YouTube Short" if is_yt else "Instagram video"
+    platform_name = "youtube" if is_yt else "instagram"
+    tag_platform = "youtube" if is_yt else "instagram"
+
+    title = (meta.title or "").strip() or default_title
     duration = format_timestamp(meta.duration_s) if meta.duration_s else ""
     uploaded = meta.upload_date.isoformat() if meta.upload_date else ""
     transcribed = (transcribed_at or datetime.now(timezone.utc)).isoformat(timespec="seconds")
 
     summary_content = summary_markdown or meta.summary
-    tag_list = ["transcript", "instagram"]
+    tag_list = ["transcript", tag_platform]
     if summary_content:
         tag_list.append("summary")
 
     lines = [
         "---",
         f"source: {_yaml(meta.url)}",
-        "platform: instagram",
+        f"platform: {platform_name}",
         f"author: {_yaml(meta.author)}",
         f"title: {_yaml(title)}",
         f"uploaded: {_yaml(uploaded)}",
@@ -130,5 +136,6 @@ def build_md_filename(meta: VideoMeta, *, date_override: date | None = None) -> 
     chronological order), otherwise today's date.
     """
     day = date_override or meta.upload_date or date.today()
-    part = sanitize_filename_part(meta.author or meta.title or "instagram", max_len=40)
+    fallback_part = "youtube" if is_youtube_url(meta.url) else "instagram"
+    part = sanitize_filename_part(meta.author or meta.title or fallback_part, max_len=40)
     return f"{day:%Y-%m-%d}_{part}_{short_id(meta.url)}.md"
